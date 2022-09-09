@@ -1,0 +1,169 @@
+# Parameters
+localSite_rg=PanNatBgpVpnLab-local-rg
+cloudSite_rg=PanNatBgpVpnLab-cloud-rg
+
+# These are reminders of the post-NAT translated address spaces for local site and cloud site
+# They aren't used directly in the script, but you'll want to keep them in mind once we get to 
+# the Network Watcher section of the examination script
+#localSite_cidr_summaryNAT=10.101.0.0/19
+#cloudSite_cidr_summaryNAT=10.100.0.0/20
+
+
+######################################
+## Tests to examine the environment ##
+######################################
+
+# 1) Test connectivity between VMs
+
+# get lists of NICs
+localNics=$( az network nic list --resource-group $localSite_rg --query '[].name' --output tsv)
+cloudNics=$( az network nic list --resource-group $cloudSite_rg --query '[].name' --output tsv)
+
+# Get list of VM private IPs
+for nicname in ${localNics[@]}; do
+    privateIp=$( az network nic show --name $nicname --resource-group $localSite_rg --query 'ipConfigurations[].privateIpAddress' --output tsv )
+    echo -e "$localSite_rg/$nicname private IP: $privateIp"
+done
+echo -e ""
+
+for nicname in ${cloudNics[@]}; do
+    privateIp=$( az network nic show --name $nicname --resource-group $cloudSite_rg --query 'ipConfigurations[].privateIpAddress' --output tsv )
+    echo -e "$cloudSite_rg/$nicname private IP: $privateIp"
+done
+
+echo -e ""
+
+# Dump VM route tables
+for nicname in ${localNics[@]}; do
+    echo -e "$localSite_rg/$nicname effective routes:"
+    az network nic show-effective-route-table --name $nicname --resource-group $localSite_rg --output table
+    echo -e ""
+done
+
+for nicname in ${cloudNics[@]}; do
+    echo -e "$cloudSite_rg/$nicname effective routes:"
+    az network nic show-effective-route-table --name $nicname --resource-group $cloudSite_rg --output table
+    echo -e ""
+done
+
+# 2) Check BGP
+
+# Dump Route Server Advertised routes
+# https://docs.microsoft.com/en-us/cli/azure/network/routeserver?view=azure-cli-latest
+rsname=$( az network routeserver list --resource-group $localSite_rg --query '[0].name' --output tsv)
+rspeerings=$( az network routeserver peering list --routeserver $rsname --resource-group $localSite_rg --query '[].name' --output tsv)
+
+echo -e "*** $localSite_rg/$rsname Route Server peerings: ***"
+az network routeserver peering list --routeserver $rsname --resource-group $localSite_rg --query '[].{name:name,peerIp:peerIp,asn:Asn}' --output table
+echo -e ""
+
+for peer in ${rspeerings[@]}; do
+    echo -e "*** $localSite_rg/$rsname/$peer advertised routes: **"
+    az network routeserver peering list-advertised-routes --name $peer --resource-group $localSite_rg --routeserver $rsname --query "[RouteServiceRole_IN_0,RouteServiceRole_IN_1][]" --output table
+    echo -e ""
+
+    echo -e "*** $localSite_rg/$rsname/$peer learned routes: **"
+    az network routeserver peering list-learned-routes --name $peer --resource-group $localSite_rg --routeserver $rsname --query "[RouteServiceRole_IN_0,RouteServiceRole_IN_1][]" --output table
+    echo -e ""
+done
+
+# Dump VPN Gateway learned routes
+vpngw=$( az network vnet-gateway list --resource-group $cloudSite_rg --query '[0].name' --output tsv )
+
+echo -e "*** $cloudSite_rg/$vpngw BGP peer status ***"
+az network vnet-gateway list-bgp-peer-status --name $vpngw --resource-group $cloudSite_rg --output table
+echo -e ""
+echo -e "*** $cloudSite_rg/$vpngw BGP learned routes ***"
+az network vnet-gateway list-learned-routes --name $vpngw --resource-group $cloudSite_rg --output table
+echo -e ""
+
+# VPN Gateways advertised routes per BGP peer.
+ips=$( az network vnet-gateway list-bgp-peer-status --name $vpngw --resource-group $cloudSite_rg --query 'value[].{ip:neighbor}' --output tsv )
+for ip in ${ips[@]}; do
+    echo -e "*** $cloudSite_rg/$vpngw advertised routes to peer $ip ***"
+    az network vnet-gateway list-advertised-routes --name $vpngw --resource-group $cloudSite_rg --peer $ip --output table
+    echo -e ""
+done
+
+# Azure Network Watcher 
+# https://docs.microsoft.com/en-us/azure/network-watcher/network-watcher-connectivity-cli
+# https://docs.microsoft.com/en-us/azure/network-watcher/network-watcher-connectivity-portal
+
+localVmIds=$( az vm list --resource-group $localSite_rg --query "[?plan.publisher!='paloaltonetworks'].id" --output tsv )
+cloudVmIds=$( az vm list --resource-group $cloudSite_rg --query "[?plan.publisher!='paloaltonetworks'].id" --output tsv )
+
+# Network Watcher needs some help when NAT is in the picture. We have to translate the IPs before testing.
+
+# Local VM->Cloud VM appears to work now
+for vmid_source in ${localVmIds[@]}; do 
+    for vmid_dest in ${cloudVmIds[@]}; do
+        if [ "$vmid_source" != "$vmid_dest" ]; then
+            echo -e "*** Testing connectivity from ${vmid_source##*/} to ${vmid_dest##*/} ***"
+            
+            # Apply naive NAT to private IP of destination VM
+            destIp=$( az vm show --ids $vmid_dest --show-details --query "privateIps" --output tsv )
+            destIpNAT=$(echo $destIp | sed 's/10.0./10.100./g' )
+            
+            az network watcher test-connectivity --source-resource $vmid_source --dest-address $destIpNAT --protocol icmp --output table
+            echo -e ""
+        fi
+    done
+done
+
+# Cloud VM->Local VM should work
+for vmid_source in ${cloudVmIds[@]}; do 
+    for vmid_dest in ${localVmIds[@]}; do
+        if [ "$vmid_source" != "$vmid_dest" ]; then
+            echo -e "*** Testing connectivity from ${vmid_source##*/} to ${vmid_dest##*/} ***"
+            
+            # Apply naive NAT to private IP of destination VM
+            destIp=$( az vm show --ids $vmid_dest --show-details --query "privateIps" --output tsv )
+            destIpNAT=$(echo $destIp | sed 's/10.0./10.101./g' )
+            
+            az network watcher test-connectivity --source-resource $vmid_source --dest-address $destIpNAT --protocol icmp --output table
+            echo -e ""
+        fi
+    done
+done
+
+# Local VM->Local VM should work
+for vmid_source in ${localVmIds[@]}; do 
+    for vmid_dest in ${localVmIds[@]}; do
+        if [ "$vmid_source" != "$vmid_dest" ]; then
+            echo -e "*** Testing connectivity from ${vmid_source##*/} to ${vmid_dest##*/} ***"
+
+            # Local to local -- NO NAT NEEDED HERE
+
+            az network watcher test-connectivity --source-resource $vmid_source --dest-resource $vmid_dest --protocol icmp --output table
+            echo -e ""
+        fi
+    done
+done
+
+# Cloud VM->Cloud VM should work
+for vmid_source in ${cloudVmIds[@]}; do 
+    for vmid_dest in ${cloudVmIds[@]}; do
+        if [ "$vmid_source" != "$vmid_dest" ]; then
+            echo -e "*** Testing connectivity from ${vmid_source##*/} to ${vmid_dest##*/} ***"
+
+            # Cloud to cloud -- NO NAT NEEDED HERE
+
+            az network watcher test-connectivity --source-resource $vmid_source --dest-resource $vmid_dest --protocol icmp --output table
+            echo -e ""
+        fi
+    done
+done
+
+# Test connectivity of local VMs to a web address
+for vmid_source in ${localVmIds[@]}; do 
+    echo -e "*** Testing connectivity from ${vmid_source##*/} to web address https://www.bing.com ***"
+    az network watcher test-connectivity --source-resource $vmid_source --dest-address 'https://www.bing.com' --protocol tcp --dest-port 443 --output table
+    echo -e ""
+done
+
+# Test connectivity of cloud VMs to a web address
+for vmid_source in ${cloudVmIds[@]}; do 
+    echo -e "*** Testing connectivity from ${vmid_source##*/} to web address https://www.bing.com ***"
+    az network watcher test-connectivity --source-resource $vmid_source --dest-address 'https://www.bing.com' --protocol tcp --dest-port 443 --output table
+    echo -e ""
+done
